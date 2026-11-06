@@ -14,7 +14,11 @@ class AudioManager {
         this.starting = false;
         this.nodes = [];
         this.nodeStatus = new Map();
+        this.connectedNodeIds = new Set();
         this.lastError = null;
+        this.nodeHealthTimer = null;
+        this.activePreferredNodeId = null;
+        this.healthCheckIntervalMs = 10000;
     }
 
     async start(client) {
@@ -52,7 +56,7 @@ class AudioManager {
             }
 
             this.manager = new LavalinkManager({
-                nodes: this.nodes,
+                nodes: this.nodes.map(({ priority, ...node }) => node),
 
                 sendToShard: (guildId, payload) => {
                     const guild = client.guilds.cache.get(guildId);
@@ -116,15 +120,22 @@ class AudioManager {
                 username: client.user.username
             });
 
-            const connected = this.getConnectedNodes();
+            const connectionDeadline = Date.now() + 20000;
+            let connected = this.getConnectedNodes();
+
+            while (connected.length === 0 && Date.now() < connectionDeadline) {
+                await new Promise(resolve => setTimeout(resolve, 250));
+                connected = this.getConnectedNodes();
+            }
 
             if (connected.length === 0) {
-                throw new Error('Tidak ada Audio Node yang berhasil terhubung.');
+                throw new Error('Tidak ada Audio Node yang berhasil terhubung setelah 20 detik.');
             }
 
             this.started = true;
             this.lastError = null;
 
+            this.startNodeHealthMonitor();
             this.updateHealth();
 
             logger.info('AUDIO CORE READY', {
@@ -237,6 +248,7 @@ class AudioManager {
         });
 
         manager.nodeManager.on('connect', node => {
+            this.connectedNodeIds.add(node.id);
             this.setNodeStatus(node.id, 'online');
 
             logger.info('AUDIO NODE CONNECTED', {
@@ -248,6 +260,7 @@ class AudioManager {
         });
 
         manager.nodeManager.on('disconnect', (node, reason) => {
+            this.connectedNodeIds.delete(node.id);
             this.setNodeStatus(node.id, 'offline', reason);
 
             logger.warn('AUDIO NODE DISCONNECTED', {
@@ -294,6 +307,103 @@ class AudioManager {
         });
     }
 
+    startNodeHealthMonitor() {
+        this.stopNodeHealthMonitor();
+
+        const checkNodes = () => {
+            if (!this.started || !this.manager) return;
+
+            const connected = this.getConnectedNodes();
+
+            for (const config of this.nodes) {
+                const node = this.getNode(config.id);
+                const online = this.connectedNodeIds.has(config.id);
+                const previous = this.nodeStatus.get(config.id);
+
+                if (online && previous?.status !== 'online') {
+                    this.setNodeStatus(config.id, 'online');
+                } else if (!online && previous?.status === 'online') {
+                    this.setNodeStatus(config.id, 'offline');
+                }
+            }
+
+            const preferred = this.getPreferredNode();
+            const nextId = preferred?.id || null;
+
+            logger.info('AUDIO NODE HEALTH CHECK', {
+                nodes: this.nodes.map(config => ({
+                    id: config.id,
+                    priority: config.priority,
+                    connected: this.connectedNodeIds.has(config.id)
+                })),
+                preferred: nextId,
+                previous: this.activePreferredNodeId
+            });
+            const previousId = this.activePreferredNodeId;
+
+            if (nextId !== previousId) {
+                this.activePreferredNodeId = nextId;
+
+                if (nextId && previousId) {
+                    const priorities = new Map(
+                        this.nodes.map(node => [node.id, node.priority])
+                    );
+
+                    const failback =
+                        (priorities.get(nextId) ?? 999) <
+                        (priorities.get(previousId) ?? 999);
+
+                    logger.warn(
+                        failback ? 'AUDIO AUTO FAILBACK' : 'AUDIO AUTO FAILOVER',
+                        {
+                            previous: previousId,
+                            active: nextId,
+                            connectedNodes: connected.length
+                        }
+                    );
+                } else if (nextId) {
+                    logger.info('AUDIO NODE ACTIVE', {
+                        active: nextId,
+                        connectedNodes: connected.length
+                    });
+                } else {
+                    logger.error('AUDIO ALL NODES OFFLINE', {
+                        totalNodes: this.nodes.length
+                    });
+                }
+
+                eventBus.publish('audio:nodePreferred', {
+                    previous: previousId,
+                    active: nextId,
+                    connectedNodes: connected.length
+                });
+            }
+
+            this.updateHealth();
+        };
+
+        checkNodes();
+
+        this.nodeHealthTimer = setInterval(
+            checkNodes,
+            this.healthCheckIntervalMs
+        );
+
+        this.nodeHealthTimer.unref?.();
+
+        logger.info('AUDIO NODE HEALTH MONITOR STARTED', {
+            intervalMs: this.healthCheckIntervalMs,
+            totalNodes: this.nodes.length
+        });
+    }
+
+    stopNodeHealthMonitor() {
+        if (this.nodeHealthTimer) {
+            clearInterval(this.nodeHealthTimer);
+            this.nodeHealthTimer = null;
+        }
+    }
+
     setNodeStatus(id, status, details = null) {
         const previous = this.nodeStatus.get(id) || {};
 
@@ -316,7 +426,7 @@ class AudioManager {
         if (!this.manager) return [];
 
         return [...this.manager.nodeManager.nodes.values()]
-            .filter(node => node.connected);
+            .filter(node => this.connectedNodeIds.has(node.id));
     }
 
     getPreferredNode() {
@@ -401,6 +511,9 @@ class AudioManager {
     }
 
     async stop() {
+        this.stopNodeHealthMonitor();
+        this.activePreferredNodeId = null;
+
         if (!this.manager) return;
 
         logger.warn('AUDIO CORE SHUTTING DOWN');

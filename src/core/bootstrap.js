@@ -80,10 +80,9 @@ async function checkSystemHealth(client) {
             }
         }
 
-        // AUDIO CORE: menunggu integrasi Audio Manager.
-        if (systemConfig.audio.enabled) {
-            healthMonitor.update('audio', 'waiting');
-        } else {
+        // Audio Manager mengelola status Audio Core.
+        // Bootstrap hanya menandai disabled jika audio dimatikan.
+        if (!systemConfig.audio.enabled) {
             healthMonitor.update('audio', 'disabled');
         }
 

@@ -48,7 +48,7 @@ function getNodeConfig(index) {
         authorization: password,
         secure: parsedUri.protocol === 'https:',
         retryAmount: 10,
-        retryDelay: 5000,
+        retryDelay: id === 'SERENETIA-PUBLIC' ? 60000 : 5000,
         enablePingOnStatsCheck: true,
         priority
     };
