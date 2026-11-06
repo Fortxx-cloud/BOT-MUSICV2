@@ -14,73 +14,139 @@ import { logger } from '../utils/logger.js';
 const pendingSearches = new Map();
 const SEARCH_TIMEOUT = 60_000;
 
+
+async function searchAudioEngine(query) {
+  const base = process.env.ZOMA_AUDIO_URL;
+  const key = process.env.ZOMA_AUDIO_API_KEY;
+
+  if (process.env.ZOMA_AUDIO_ENABLED !== 'true' || !base || !key) {
+    throw new Error('ZOMA AUDIO ENGINE belum dikonfigurasi.');
+  }
+
+  const response = await fetch(`${base}/search`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ query }),
+    signal: AbortSignal.timeout(60000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Audio Engine HTTP ${response.status}`);
+  }
+
+  const raw = await response.json();
+
+  if (raw.status !== 'success' || !Array.isArray(raw.results)) {
+    throw new Error('Respons pencarian Audio Engine tidak valid.');
+  }
+
+  const tracks = raw.results.map(item => ({
+    encoded: null,
+    requester: null,
+    info: {
+      identifier: item.id,
+      title: item.title,
+      author: item.uploader || 'Unknown artist',
+      duration: Number(item.duration || 0) * 1000,
+      uri: item.url,
+      sourceName: 'youtube',
+      artworkUrl: item.thumbnail,
+      isStream: false
+    }
+  }));
+
+  logger.info('HF AUDIO SEARCH SUCCESS', {
+    count: tracks.length
+  });
+
+  return {
+    loadType: 'search',
+    tracks,
+    exception: null
+  };
+}
+
 async function searchConnectedNodes(query, botId, requester) {
-    const configs = audioManager.nodes || [];
-    const connected = audioManager.getConnectedNodes()
-        .sort((a, b) => {
-            const pa = configs.find(n => n.id === a.id)?.priority ?? 999;
-            const pb = configs.find(n => n.id === b.id)?.priority ?? 999;
-            return pa - pb;
-        });
+  try {
+    const result = await searchAudioEngine(query);
 
-    if (!connected.length) {
-        throw new Error('Tidak ada audio node yang aktif.');
+    for (const track of result.tracks) {
+      track.requester = requester;
     }
 
-    const errors = [];
+    return result;
+  } catch (error) {
+    logger.warn('HF AUDIO SEARCH FAILED - USING NODE FAILOVER', {
+      error: error.message
+    });
+  }
 
-    for (const node of connected) {
-        const config = configs.find(n => n.id === node.id);
-        if (!config) continue;
+  const configs = audioManager.nodes || [];
+  const connected = audioManager.getConnectedNodes()
+    .sort((a, b) => {
+      const pa = configs.find(n => n.id === a.id)?.priority ?? 999;
+      const pb = configs.find(n => n.id === b.id)?.priority ?? 999;
+      return pa - pb;
+    });
 
-        try {
-            const base = `${config.secure ? 'https' : 'http'}://${config.host}:${config.port}`;
-            const url = new URL('/v4/loadtracks', base);
-            url.searchParams.set('identifier', query);
+  if (!connected.length) {
+    throw new Error('Audio Engine dan seluruh Audio Node gagal.');
+  }
 
-            const response = await fetch(url, {
-                headers: {
-                    Authorization: config.authorization,
-                    'User-Id': botId,
-                    'Client-Name': 'ZOMA-APP-V2/2.0.0'
-                },
-                signal: AbortSignal.timeout(15000)
-            });
+  const errors = [];
 
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
-            }
+  for (const node of connected) {
+    const config = configs.find(n => n.id === node.id);
+    if (!config) continue;
 
-            const raw = await response.json();
-            const tracks = Array.isArray(raw.data)
-                ? raw.data
-                : raw.data ? [raw.data] : [];
+    try {
+      const base = `${config.secure ? 'https' : 'http'}://${config.host}:${config.port}`;
+      const url = new URL('/v4/loadtracks', base);
+      url.searchParams.set('identifier', query);
 
-            for (const track of tracks) {
-                track.requester = requester;
-            }
+      const response = await fetch(url, {
+        headers: {
+          Authorization: config.authorization,
+          'User-Id': botId,
+          'Client-Name': 'ZOMA-APP-V2/2.0.0'
+        },
+        signal: AbortSignal.timeout(15000)
+      });
 
-            logger.info('SEARCH NODE SUCCESS', {
-                node: node.id,
-                loadType: raw.loadType,
-                trackCount: tracks.length
-            });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-            return {
-                loadType: String(raw.loadType || '').toLowerCase(),
-                tracks,
-                exception: raw.exception || null
-            };
-        } catch (error) {
-            errors.push(`${node.id}: ${error.message}`);
-            logger.warn('SEARCH NODE FAILED', {
-                node: node.id,
-                error: error.message
-            });
-        }
+      const raw = await response.json();
+      const tracks = Array.isArray(raw.data)
+        ? raw.data
+        : raw.data ? [raw.data] : [];
+
+      for (const track of tracks) {
+        track.requester = requester;
+      }
+
+      logger.info('SEARCH NODE SUCCESS', {
+        node: node.id,
+        trackCount: tracks.length
+      });
+
+      return {
+        loadType: String(raw.loadType || '').toLowerCase(),
+        tracks,
+        exception: raw.exception || null
+      };
+    } catch (error) {
+      errors.push(`${node.id}: ${error.message}`);
+      logger.warn('SEARCH NODE FAILED', {
+        node: node.id,
+        error: error.message
+      });
     }
+  }
 
-    throw new Error(`Semua node pencarian gagal: ${errors.join(' | ')}`);
+  throw new Error(`Semua jalur pencarian gagal: ${errors.join(' | ')}`);
 }
 
 const MAX_RESULTS = 5;
@@ -267,7 +333,7 @@ export async function executeSearch(interaction) {
                 track
                 && track.info
                 && track.info.title
-                && track.encoded
+                && (track.encoded || track.info.uri)
             )
             .slice(0, MAX_RESULTS);
 

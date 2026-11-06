@@ -146,27 +146,88 @@ class LocalPlaybackEngine {
         });
     }
 
+    async downloadFromAudioEngine(uri, onProgress) {
+        const base = process.env.ZOMA_AUDIO_URL;
+        const key = process.env.ZOMA_AUDIO_API_KEY;
+
+        if (!base || !key) {
+            throw new Error('Konfigurasi ZOMA AUDIO ENGINE tidak tersedia.');
+        }
+
+        const response = await fetch(`${base}/stream`, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${key}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ url: uri }),
+            signal: AbortSignal.timeout(
+                Number(process.env.ZOMA_AUDIO_TIMEOUT_MS || 180000)
+            )
+        });
+
+        if (!response.ok) {
+            const detail = await response.text().catch(() => '');
+            throw new Error(
+                `Audio Engine HTTP ${response.status}: ${detail.slice(0, 300)}`
+            );
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+
+        if (!buffer.length) {
+            throw new Error('Audio Engine mengembalikan file kosong.');
+        }
+
+        if (buffer.length > MAX_FILE_MB * 1024 * 1024) {
+            throw new Error('Ukuran audio melewati batas cache.');
+        }
+
+        const file = path.join(CACHE_DIR, `${randomUUID()}.mp3`);
+        await fs.writeFile(file, buffer);
+
+        if (onProgress) onProgress(100);
+
+        logger.info('HF AUDIO DOWNLOAD COMPLETE', {
+            sizeMB: Number(buffer.length / 1024 / 1024).toFixed(2)
+        });
+
+        return file;
+    }
+
     async download(track, onProgress) {
         const info = track.info || {};
-
-        const uri = info.uri ||
-            (
-                info.identifier && info.sourceName === 'youtube'
-                    ? `https://www.youtube.com/watch?v=${info.identifier}`
-                    : null
-            );
+        const uri = info.uri || (
+            info.identifier && info.sourceName === 'youtube'
+                ? `https://www.youtube.com/watch?v=${info.identifier}`
+                : null
+        );
 
         if (!uri || !/^https?:\/\//i.test(uri)) {
             throw new Error('URL sumber audio tidak tersedia.');
         }
 
+        if (process.env.ZOMA_AUDIO_ENABLED === 'true') {
+            try {
+                logger.info('PRIMARY AUDIO SOURCE: HF ENGINE', {
+                    title: info.title
+                });
+
+                return await this.downloadFromAudioEngine(uri, onProgress);
+            } catch (error) {
+                logger.warn('HF STREAM FAILED - USING LOCAL YTDLP', {
+                    title: info.title,
+                    error: error.message
+                });
+            }
+        }
+
+        logger.info('BACKUP AUDIO SOURCE: LOCAL YTDLP', {
+            title: info.title
+        });
+
         const id = randomUUID();
         const template = path.join(CACHE_DIR, `${id}.%(ext)s`);
-
-        logger.info('AUDIO DOWNLOAD START', {
-            title: info.title,
-            source: info.sourceName
-        });
 
         await this.runDownload(uri, template, onProgress);
 
@@ -190,7 +251,7 @@ class LocalPlaybackEngine {
             throw new Error('Ukuran audio melewati batas cache.');
         }
 
-        logger.info('AUDIO DOWNLOAD COMPLETE', {
+        logger.info('LOCAL AUDIO DOWNLOAD COMPLETE', {
             title: info.title,
             sizeMB: Number(stat.size / 1024 / 1024).toFixed(2)
         });
